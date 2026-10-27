@@ -1,0 +1,16 @@
+{
+  "name": "siva-hesab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "سیوا حساب - برنامه فارسی فروش، فاکتور و انبار",
+  "scripts": {
+    "android:sync": "cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "6.2.0",
+    "@capacitor/core": "6.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "6.2.0"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "سیوا حساب",
+  "short_name": "سیوا حساب",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#f5efdf",
+  "theme_color": "#173f32",
+  "lang": "fa",
+  "dir": "rtl",
+  "icons": []
+}

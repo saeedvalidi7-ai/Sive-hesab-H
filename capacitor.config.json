@@ -1,0 +1,8 @@
+{
+  "appId": "ir.sivahesab.app",
+  "appName": "سیوا حساب",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  }
+}
