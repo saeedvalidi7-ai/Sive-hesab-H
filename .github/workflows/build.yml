@@ -1,59 +1,186 @@
 
-name: Build Siva Hesab APK
+name: Build Signed Release APK
 
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  APP_LABEL: "سیوا حساب"
+  APK_NAME: SivaHesab
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
+      - name: Check signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Secret $v is missing or empty"
+              exit 1
+            fi
+          done
+
+      - name: Find project
+        run: |
+          DIR=$(dirname "$(find . -name pubspec.yaml -not -path './.git/*' | head -1)")
+          if [ ! -f pubspec.yaml ]; then
+            if [ -z "$DIR" ] || [ ! -f "$DIR/pubspec.yaml" ]; then
+              echo "::error::pubspec.yaml not found"
+              exit 1
+            fi
+            cp -r "$DIR"/. .
+          fi
+
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: subosito/flutter-action@v2
         with:
-          node-version: '20'
-          cache: npm
+          channel: stable
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build web application
-        run: npm run build --if-present
-
-      - name: Install Capacitor Android
+      - name: Generate Android folder
         run: |
-          npm install @capacitor/core @capacitor/cli @capacitor/android
-          npx cap add android
+          NAME=$(grep -m1 '^name:' pubspec.yaml | awk '{print $2}')
+          flutter create --project-name "$NAME" --org ir.siva --platforms=android _gen
+          cp -r _gen/android android
+          sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_LABEL\"/" android/app/src/main/AndroidManifest.xml
 
-      - name: Sync Android project
-        run: npx cap sync android
-
-      - name: Build APK
-        working-directory: android
+      - name: App icon and launch screen
         run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug
+          RES=android/app/src/main/res
+          if [ -d android_res ]; then
+            find "$RES" -name 'ic_launcher*' -delete
+            cp -r android_res/. "$RES"/
+            sed -i 's#android:icon="[^"]*"#android:icon="@mipmap/ic_launcher"#' android/app/src/main/AndroidManifest.xml
+          else
+            echo "android_res folder missing - default icon will be used"
+          fi
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Prepare keystore and key.properties
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > android/app/upload-keystore.jks
+          printf 'storePassword=%s\nkeyPassword=%s\nkeyAlias=%s\nstoreFile=%s\n' \
+            "$KEYSTORE_PASSWORD" "$KEYSTORE_PASSWORD" "$KEY_ALIAS" \
+            "$GITHUB_WORKSPACE/android/app/upload-keystore.jks" > android/key.properties
+          keytool -list -keystore android/app/upload-keystore.jks \
+            -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" > /dev/null
+          echo "Keystore and alias are valid"
+
+      - name: Configure release signing in Gradle
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          app = pathlib.Path('android/app')
+          kts, gr = app / 'build.gradle.kts', app / 'build.gradle'
+
+          if kts.exists():
+              p = kts
+              s = p.read_text()
+              old = 'signingConfig = signingConfigs.getByName("debug")'
+              if old not in s:
+                  sys.exit('ERROR: debug signing line not found in build.gradle.kts')
+              s = s.replace(old, 'signingConfig = signingConfigs.getByName("release")')
+              props = (
+                  'val keystoreProperties = Properties()\n'
+                  'val keystorePropertiesFile = rootProject.file("key.properties")\n'
+                  'keystoreProperties.load(FileInputStream(keystorePropertiesFile))\n\n')
+              block = (
+                  '    signingConfigs {\n'
+                  '        create("release") {\n'
+                  '            keyAlias = keystoreProperties["keyAlias"] as String\n'
+                  '            keyPassword = keystoreProperties["keyPassword"] as String\n'
+                  '            storeFile = file(keystoreProperties["storeFile"] as String)\n'
+                  '            storePassword = keystoreProperties["storePassword"] as String\n'
+                  '        }\n'
+                  '    }\n\n')
+          elif gr.exists():
+              p = gr
+              s = p.read_text()
+              old = 'signingConfig signingConfigs.debug'
+              if old not in s:
+                  sys.exit('ERROR: debug signing line not found in build.gradle')
+              s = s.replace(old, 'signingConfig signingConfigs.release')
+              props = (
+                  'def keystoreProperties = new Properties()\n'
+                  "def keystorePropertiesFile = rootProject.file('key.properties')\n"
+                  'keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n\n')
+              block = (
+                  '    signingConfigs {\n'
+                  '        release {\n'
+                  "            keyAlias keystoreProperties['keyAlias']\n"
+                  "            keyPassword keystoreProperties['keyPassword']\n"
+                  "            storeFile file(keystoreProperties['storeFile'])\n"
+                  "            storePassword keystoreProperties['storePassword']\n"
+                  '        }\n'
+                  '    }\n\n')
+          else:
+              sys.exit('ERROR: Android Gradle file not found')
+
+          s, n1 = re.subn(r'^android \{', lambda m: props + 'android {', s, count=1, flags=re.M)
+          s, n2 = re.subn(r'^[ \t]*buildTypes \{', lambda m: block + m.group(0), s, count=1, flags=re.M)
+
+          if n1 != 1 or n2 != 1:
+              sys.exit('ERROR: Gradle configuration blocks not found')
+
+          s = 'import java.io.FileInputStream\nimport java.util.Properties\n\n' + s
+          p.write_text(s)
+          print('Patched', p)
+          PY
+
+      - run: flutter pub get
+      - run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
+      - run: flutter build apk --release
+
+      - name: Verify APK signature
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          test -f "$APK" || { echo "::error::APK not found"; exit 1; }
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          APKSIGNER=$(ls "$SDK"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --verbose --print-certs "$APK" > verify.txt || { cat verify.txt; exit 1; }
+          cat verify.txt
+          grep -q "Verified using v1 scheme (JAR signing): true" verify.txt || exit 1
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" verify.txt || exit 1
+          if grep -qi "Android Debug" verify.txt; then
+            echo "::error::APK is signed with the DEBUG key"
+            exit 1
+          fi
+          keytool -printcert -jarfile "$APK" > cert.txt
+          cat cert.txt
+          if grep -qi "CN=Android Debug" cert.txt; then
+            echo "::error::Debug certificate found"
+            exit 1
+          fi
+          echo "Release signature verified"
+
+      - name: Rename APK
+        run: cp build/app/outputs/flutter-apk/app-release.apk "build/${APK_NAME}-release.apk"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: siva-hesab-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: SivaHesab-signed-APK
+          path: build/SivaHesab-release.apk
           if-no-files-found: error
-          retention-days: 14
+
+      - name: Cleanup secrets from runner
+        if: always()
+        run: rm -f android/app/upload-keystore.jks android/key.properties
